@@ -5,6 +5,7 @@ from typing import List
 import fire
 import torch
 import transformers
+import peft
 from datasets import load_dataset
 
 """
@@ -17,22 +18,28 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict,
 )
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
 
 from utils.prompter import Prompter
 
+print(f"PyTorch version: {torch.__version__}")
+print(f"Transformers version: {transformers.__version__}")
+print(f"Peft version: {peft.__version__}")
 
 def train(
     # model/data params
-    base_model: str = "",  # the only required argument
-    data_path: str = "yahma/alpaca-cleaned",
+    base_model: str = "facebook/opt-125m",  # 使用 OPT 模型
+    data_path: str = "alpaca_data.json",
     output_dir: str = "./lora-alpaca",
     # training hyperparams
-    batch_size: int = 128,
-    micro_batch_size: int = 4,
+    batch_size: int = 32,
+    micro_batch_size: int = 2,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
     cutoff_len: int = 256,
@@ -45,6 +52,8 @@ def train(
         "q_proj",
         "v_proj",
     ],
+    # 添加 CPU 训练支持
+    device: str = "cpu",  # 如果是 M1/M2 Mac 使用 CPU
     # llm hyperparams
     train_on_inputs: bool = True,  # if False, masks out inputs in loss
     add_eos_token: bool = False,
@@ -109,19 +118,17 @@ def train(
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
-    model = LlamaForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        load_in_8bit=True,
-        torch_dtype=torch.float16,
-        device_map=device_map,
+        torch_dtype=torch.float32,
+        device_map="auto",
+        load_in_8bit=False,
     )
 
-    tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
 
-    tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
-    )
-    tokenizer.padding_side = "left"  # Allow batched inference
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
 
     def tokenize(prompt, add_eos_token=True):
         # there's probably a way to do this with the tokenizer settings
@@ -171,8 +178,8 @@ def train(
             ]  # could be sped up, probably
         return tokenized_full_prompt
 
-    model = prepare_model_for_int8_training(model)
-
+    # model = prepare_model_for_kbit_training(model)  # 注释掉这行
+    
     config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -239,7 +246,7 @@ def train(
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            fp16=True,
+            fp16=False,
             logging_steps=10,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
