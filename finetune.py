@@ -1,22 +1,25 @@
 import os
 import sys
 from typing import List
+import logging
 
-import fire
 import torch
 import transformers
 import peft
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
+import requests
+import json
+import psutil
 
 """
 Unused imports:
-import torch.nn as nn
+import torch.nn as 
 import bitsandbytes as bnb
 """
 
 from peft import (
-    LoraConfig,
-    get_peft_model,
     get_peft_model_state_dict,
     prepare_model_for_kbit_training,
     set_peft_model_state_dict,
@@ -31,260 +34,352 @@ from utils.prompter import Prompter
 print(f"PyTorch version: {torch.__version__}")
 print(f"Transformers version: {transformers.__version__}")
 print(f"Peft version: {peft.__version__}")
+print(f"Device: {torch.device('mps' if torch.backends.mps.is_available() else 'cpu')}")
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# 1. API 设置
+API_KEY = os.getenv("HF_API_KEY")  # Get API key from environment variable
+MODEL = "deepseek-ai/DeepSeek-R1-Distill-Llama-7B"
+API_URL = f"https://api-inference.huggingface.co/models/{MODEL}"
+
+def query_deepseek(prompt, api_key=None):
+    """
+    Call DeepSeek API to generate text
+    Args:
+      prompt: Input text prompt
+      api_key: Optional API key, will use environment variable if not provided
+    Returns:
+      Generated text or None if error
+    """
+    if not api_key:
+        api_key = os.getenv("HF_API_KEY")
+        if not api_key:
+            logging.error("No API key provided. Set HF_API_KEY environment variable")
+            return None
+            
+    headers = {"Authorization": f"Bearer {api_key}"}
+    api_url = "https://api-inference.huggingface.co/models/deepseek-ai/DeepSeek-R1-Distill-Llama-7B"
+    
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 256,
+            "temperature": 0.7,
+            "top_p": 0.9
+        }
+    }
+    
+    try:
+        response = requests.post(api_url, headers=headers, json=payload)
+        return response.json() if response.status_code == 200 else None
+    except Exception as e:
+        logging.error(f"API Error: {e}")
+        return None
+
+# 2. 加载本地模型
+def load_local_model():
+    """加载本地 LLaMA 模型"""
+    model_name = "your_local_llama_path"  # 替换为你的本地模型路径
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    return model, tokenizer
+
+# 3. 准备训练数据
+def prepare_training_data():
+    """从 jsonl 文件准备训练数据"""
+    training_data = []
+    with open('data/crafting_instruction.jsonl', 'r') as f:
+        for line in f:
+            item = json.loads(line)
+            prompt = f"How do I craft {item['instruction']}?"
+            training_data.append({
+                'prompt': prompt,
+                'target': item['output']
+            })
+    return training_data
+
+# 4. 知识蒸馏训练
+def train_with_distillation(student_model, tokenizer, training_data, num_epochs=3):
+    """使用知识蒸馏训练本地模型"""
+    optimizer = AdamW(student_model.parameters(), lr=5e-5)
+    loss_fn = CrossEntropyLoss()
+    
+    student_model.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for item in training_data:
+            # 获取教师模型输出
+            teacher_output = query_deepseek(item['prompt'], API_KEY)
+            if not teacher_output:
+                continue
+                
+            # 准备输入
+            input_ids = tokenizer(
+                item['prompt'], 
+                return_tensors="pt",
+                truncation=True,
+                max_length=512
+            ).input_ids
+            
+            # 准备标签
+            labels = tokenizer(
+                teacher_output[0]['generated_text'],
+                return_tensors="pt",
+                truncation=True,
+                max_length=512
+            ).input_ids
+            
+            # 训练步骤
+            optimizer.zero_grad()
+            outputs = student_model(input_ids, labels=labels)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        avg_loss = total_loss / len(training_data)
+        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
+
+def prepare_dataset(data_path):
+    """
+    Load and prepare the dataset from jsonl file.
+    Args:
+      data_path: Path to the jsonl data file
+    Returns:
+      Processed dataset ready for training
+    """
+    # Load raw data
+    raw_dataset = []
+    with open(data_path, 'r') as f:
+        for line in f:
+            raw_dataset.append(json.loads(line))
+    
+    # Convert to Dataset format
+    from datasets import Dataset
+    dataset = Dataset.from_list(raw_dataset)
+    
+    # Apply preprocessing
+    tokenized_dataset = dataset.map(
+        preprocess_function,
+        remove_columns=dataset.column_names,
+        num_proc=1
+    )
+    
+    return tokenized_dataset
+
+def preprocess_function(examples):
+    """
+    Preprocess the training examples for the model.
+    Args:
+      examples: Dict containing the example data
+    Returns:
+      Dict with processed input_ids, attention_mask and labels
+    """
+    # Format the text in a more structured way
+    text = f"Instruction: {examples['instruction']}\n"
+    text += f"Input: {examples['input']}\n" 
+    text += f"Output: {examples['output']}"
+    
+    # Add EOS token
+    text = f"{text}{tokenizer.eos_token}"
+    
+    # Tokenize with padding and truncation
+    result = tokenizer(
+        text,
+        truncation=True,
+        max_length=512,
+        padding="max_length",
+        return_tensors=None
+    )
+    
+    # Set labels for training
+    result["labels"] = result["input_ids"].copy()
+    
+    return result
 
 def train(
-    # model/data params
-    base_model: str = "facebook/opt-125m",  # 使用 OPT 模型
-    data_path: str = "alpaca_data.json",
-    output_dir: str = "./lora-alpaca",
-    # training hyperparams
-    batch_size: int = 32,
+    base_model: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+    data_path: str = "data/crafting_instruction.jsonl",
+    output_dir: str = "./lora-crafting",
+    batch_size: int = 4,
     micro_batch_size: int = 2,
-    num_epochs: int = 3,
-    learning_rate: float = 3e-4,
-    cutoff_len: int = 256,
-    val_set_size: int = 2000,
-    # lora hyperparams
+    num_epochs: int = 5,
+    learning_rate: float = 2e-4,
     lora_r: int = 8,
     lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    lora_target_modules: List[str] = [
-        "q_proj",
-        "v_proj",
-    ],
-    # 添加 CPU 训练支持
-    device: str = "cpu",  # 如果是 M1/M2 Mac 使用 CPU
-    # llm hyperparams
-    train_on_inputs: bool = True,  # if False, masks out inputs in loss
-    add_eos_token: bool = False,
-    group_by_length: bool = False,  # faster, but produces an odd training loss curve
-    # wandb params
-    wandb_project: str = "",
-    wandb_run_name: str = "",
-    wandb_watch: str = "",  # options: false | gradients | all
-    wandb_log_model: str = "",  # options: false | true
-    resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
-    prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    lora_dropout: float = 0.1,
 ):
-    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        print(
-            f"Training Alpaca-LoRA model with params:\n"
-            f"base_model: {base_model}\n"
-            f"data_path: {data_path}\n"
-            f"output_dir: {output_dir}\n"
-            f"batch_size: {batch_size}\n"
-            f"micro_batch_size: {micro_batch_size}\n"
-            f"num_epochs: {num_epochs}\n"
-            f"learning_rate: {learning_rate}\n"
-            f"cutoff_len: {cutoff_len}\n"
-            f"val_set_size: {val_set_size}\n"
-            f"lora_r: {lora_r}\n"
-            f"lora_alpha: {lora_alpha}\n"
-            f"lora_dropout: {lora_dropout}\n"
-            f"lora_target_modules: {lora_target_modules}\n"
-            f"train_on_inputs: {train_on_inputs}\n"
-            f"add_eos_token: {add_eos_token}\n"
-            f"group_by_length: {group_by_length}\n"
-            f"wandb_project: {wandb_project}\n"
-            f"wandb_run_name: {wandb_run_name}\n"
-            f"wandb_watch: {wandb_watch}\n"
-            f"wandb_log_model: {wandb_log_model}\n"
-            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
-            f"prompt template: {prompt_template_name}\n"
-        )
-    assert (
-        base_model
-    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
-    gradient_accumulation_steps = batch_size // micro_batch_size
-
-    prompter = Prompter(prompt_template_name)
-
-    device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
-
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
-    )
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-
+    """
+    Main training function with optimized parameters for crafting instructions.
+    Args:
+      base_model: Base model to fine-tune
+      data_path: Path to training data
+      output_dir: Output directory for saved model
+      batch_size: Training batch size
+      micro_batch_size: Micro batch size for gradient accumulation
+      num_epochs: Number of training epochs
+      learning_rate: Learning rate
+      lora_r: LoRA attention dimension
+      lora_alpha: LoRA alpha parameter
+      lora_dropout: LoRA dropout rate
+    """
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    print("Loading model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side='right')
+    
+    # 设置特殊token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'right'
+    
+    # 修改模型加载方式
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.float32,
-        device_map="auto",
-        load_in_8bit=False,
+        device_map=None,
     )
-
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-
-    tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "left"
-
-    def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-            result["input_ids"][-1] != tokenizer.eos_token_id
-            and len(result["input_ids"]) < cutoff_len
-            and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-
-        result["labels"] = result["input_ids"].copy()
-
-        return result
-
-    def generate_and_tokenize_prompt(data_point):
-        full_prompt = prompter.generate_prompt(
-            data_point["instruction"],
-            data_point["input"],
-            data_point["output"],
-        )
-        tokenized_full_prompt = tokenize(full_prompt)
-        if not train_on_inputs:
-            user_prompt = prompter.generate_prompt(
-                data_point["instruction"], data_point["input"]
-            )
-            tokenized_user_prompt = tokenize(
-                user_prompt, add_eos_token=add_eos_token
-            )
-            user_prompt_len = len(tokenized_user_prompt["input_ids"])
-
-            if add_eos_token:
-                user_prompt_len -= 1
-
-            tokenized_full_prompt["labels"] = [
-                -100
-            ] * user_prompt_len + tokenized_full_prompt["labels"][
-                user_prompt_len:
-            ]  # could be sped up, probably
-        return tokenized_full_prompt
-
-    # model = prepare_model_for_kbit_training(model)  # 注释掉这行
     
-    config = LoraConfig(
+    # 确保模型在训练模式
+    model.train()
+    model = model.to(device)
+    
+    print("Configuring LoRA...")
+    lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        inference_mode=False
     )
-    model = get_peft_model(model, config)
-
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        data = load_dataset("json", data_files=data_path)
-    else:
-        data = load_dataset(data_path)
-
-    if resume_from_checkpoint:
-        # Check the available weights and load them
-        checkpoint_name = os.path.join(
-            resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
-        if not os.path.exists(checkpoint_name):
-            checkpoint_name = os.path.join(
-                resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
-            resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
-            adapters_weights = torch.load(checkpoint_name)
-            set_peft_model_state_dict(model, adapters_weights)
-        else:
-            print(f"Checkpoint {checkpoint_name} not found")
-
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
-
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = None
-
-    if not ddp and torch.cuda.device_count() > 1:
-        # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
-        model.is_parallelizable = True
-        model.model_parallel = True
-
-    trainer = transformers.Trainer(
+    
+    # 转换为 PEFT 模型
+    model = get_peft_model(model, lora_config)
+    
+    # 确保所有需要训练的参数都设置了 requires_grad=True
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.requires_grad = True
+    
+    model.print_trainable_parameters()
+    
+    print("Preparing dataset...")
+    tokenized_dataset = prepare_dataset(data_path)
+    
+    # Update training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        per_device_train_batch_size=micro_batch_size,
+        gradient_accumulation_steps=batch_size // micro_batch_size,
+        num_train_epochs=num_epochs,
+        learning_rate=learning_rate,
+        fp16=False,
+        bf16=False,
+        logging_steps=10,
+        save_strategy="epoch",
+        save_total_limit=3,
+        push_to_hub=False,
+        dataloader_num_workers=0,
+        gradient_checkpointing=False,
+        optim="adamw_torch",
+        max_grad_norm=0.3,
+        warmup_ratio=0.03,
+        weight_decay=0.01,
+        remove_unused_columns=False,
+        torch_compile=False,
+    )
+    
+    # 创建 trainer
+    trainer = Trainer(
         model=model,
-        train_dataset=train_data,
-        eval_dataset=val_data,
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
-            num_train_epochs=num_epochs,
-            learning_rate=learning_rate,
-            fp16=False,
-            logging_steps=10,
-            optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
-            save_strategy="steps",
-            eval_steps=200 if val_set_size > 0 else None,
-            save_steps=200,
-            output_dir=output_dir,
-            save_total_limit=3,
-            load_best_model_at_end=True if val_set_size > 0 else False,
-            ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name=wandb_run_name if use_wandb else None,
-        ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
-    )
-    model.config.use_cache = False
-
-    old_state_dict = model.state_dict
-    model.state_dict = (
-        lambda self, *_, **__: get_peft_model_state_dict(
-            self, old_state_dict()
+        args=training_args,
+        train_dataset=tokenized_dataset,
+        data_collator=transformers.DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, 
+            mlm=False
         )
-    ).__get__(model, type(model))
-
-    if torch.__version__ >= "2" and sys.platform != "win32":
-        model = torch.compile(model)
-
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-
-    model.save_pretrained(output_dir)
-
-    print(
-        "\n If there's a warning about missing keys above, please disregard :)"
     )
+    
+    print("Starting training...")
+    trainer.train()
+    
+    print("Saving model...")
+    model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
+def get_memory_info():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    return f"Memory used: {memory_info.rss / 1024 / 1024:.2f} MB"
+
+def test_setup():
+    print("\n=== 环境检查 ===")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"Transformers version: {transformers.__version__}")
+    print(f"Initial {get_memory_info()}")
+    
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print(f"\n=== 使用设备: {device} ===")
+    
+    try:
+        print("\n=== 开始加载模型 ===")
+        # 使用更小的模型进行测试
+        model_name = "facebook/opt-125m"  # 只有125M参数的小模型
+        
+        print("1. 加载 tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        print(f"Tokenizer 加载成功 - {get_memory_info()}")
+        
+        print("\n2. 加载模型...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+        print(f"模型加载成功 - {get_memory_info()}")
+        
+        print("\n3. 移动模型到设备...")
+        model = model.to(device)
+        print(f"模型已移动到 {device} - {get_memory_info()}")
+        
+        print("\n=== 测试简单推理 ===")
+        input_text = "Hello"
+        inputs = tokenizer(input_text, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_length=10,
+                num_return_sequences=1
+            )
+        
+        result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"输入: {input_text}")
+        print(f"输出: {result}")
+        print(f"Final {get_memory_info()}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n错误: {str(e)}")
+        print(f"错误类型: {type(e)}")
+        import traceback
+        print(f"错误堆栈: {traceback.format_exc()}")
+        return False
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    success = test_setup()
+    print(f"\n测试{'成功' if success else '失败'}")

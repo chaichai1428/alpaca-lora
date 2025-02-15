@@ -13,3 +13,23 @@ test_data.json
 todo.txt
 .venv
 .vscode
+myenv
+.env
+lora-crafting/
+data/
+.DS_Store
+.dockerignore
+
+# Environment variables
+.env
+*.env
+
+# API keys and secrets
+.env*
+.flaskenv*
+!.env.project
+!.env.vault
+
+# Other sensitive data
+*.key
+*.pem
