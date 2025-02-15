@@ -12,6 +12,7 @@ from datasets import load_dataset
 import requests
 import json
 import psutil
+import gc
 
 """
 Unused imports:
@@ -152,108 +153,74 @@ def train_with_distillation(student_model, tokenizer, training_data, num_epochs=
 
 def prepare_dataset(data_path):
     """
-    Load and prepare the dataset from jsonl file.
+    Load and prepare dataset from jsonl file for training
     Args:
       data_path: Path to the jsonl data file
     Returns:
       Processed dataset ready for training
     """
-    # Load raw data
-    raw_dataset = []
-    with open(data_path, 'r') as f:
+    # Load dataset from jsonl
+    dataset = []
+    with open(data_path, 'r', encoding='utf-8') as f:
         for line in f:
-            raw_dataset.append(json.loads(line))
+            item = json.loads(line)
+            # Format the text in a chat-like format
+            text = f"### Instruction: {item['instruction']}\n"
+            text += f"### Input: {item['input']}\n"
+            text += f"### Response: {item['output']}\n"
+            dataset.append({"text": text})
     
-    # Convert to Dataset format
     from datasets import Dataset
-    dataset = Dataset.from_list(raw_dataset)
+    dataset = Dataset.from_list(dataset)
     
-    # Apply preprocessing
-    tokenized_dataset = dataset.map(
-        preprocess_function,
-        remove_columns=dataset.column_names,
-        num_proc=1
-    )
-    
-    return tokenized_dataset
+    return dataset
 
 def preprocess_function(examples):
     """
-    Preprocess the training examples for the model.
-    Args:
-      examples: Dict containing the example data
-    Returns:
-      Dict with processed input_ids, attention_mask and labels
+    Preprocess the examples for training
     """
-    # Format the text in a more structured way
-    text = f"Instruction: {examples['instruction']}\n"
-    text += f"Input: {examples['input']}\n" 
-    text += f"Output: {examples['output']}"
-    
-    # Add EOS token
-    text = f"{text}{tokenizer.eos_token}"
-    
-    # Tokenize with padding and truncation
-    result = tokenizer(
-        text,
+    # Tokenize the texts
+    tokenized = tokenizer(
+        examples["text"],
         truncation=True,
         max_length=512,
         padding="max_length",
         return_tensors=None
     )
     
-    # Set labels for training
-    result["labels"] = result["input_ids"].copy()
+    # Set up the labels for training
+    tokenized["labels"] = tokenized["input_ids"].copy()
     
-    return result
+    return tokenized
 
 def train(
     base_model: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
     data_path: str = "data/crafting_instruction.jsonl",
     output_dir: str = "./lora-crafting",
+    api_key: str = None,
     batch_size: int = 4,
     micro_batch_size: int = 2,
-    num_epochs: int = 5,
+    num_epochs: int = 3,
     learning_rate: float = 2e-4,
     lora_r: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.1,
 ):
-    """
-    Main training function with optimized parameters for crafting instructions.
-    Args:
-      base_model: Base model to fine-tune
-      data_path: Path to training data
-      output_dir: Output directory for saved model
-      batch_size: Training batch size
-      micro_batch_size: Micro batch size for gradient accumulation
-      num_epochs: Number of training epochs
-      learning_rate: Learning rate
-      lora_r: LoRA attention dimension
-      lora_alpha: LoRA alpha parameter
-      lora_dropout: LoRA dropout rate
-    """
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     print("Loading model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side='right')
     
-    # 设置特殊token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'right'
     
-    # 修改模型加载方式
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.float32,
         device_map=None,
-    )
-    
-    # 确保模型在训练模式
-    model.train()
-    model = model.to(device)
+    ).to(device)
     
     print("Configuring LoRA...")
     lora_config = LoraConfig(
@@ -266,20 +233,38 @@ def train(
         inference_mode=False
     )
     
-    # 转换为 PEFT 模型
     model = get_peft_model(model, lora_config)
-    
-    # 确保所有需要训练的参数都设置了 requires_grad=True
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            param.requires_grad = True
-    
     model.print_trainable_parameters()
     
     print("Preparing dataset...")
-    tokenized_dataset = prepare_dataset(data_path)
+    # 将 preprocess_function 移到这里，这样它可以访问 tokenizer
+    def preprocess_function(examples):
+        text = examples["text"]
+        text = f"{text}{tokenizer.eos_token}"
+        
+        return tokenizer(
+            text,
+            truncation=True,
+            max_length=512,
+            padding="max_length",
+            return_tensors=None
+        )
     
-    # Update training arguments
+    raw_dataset = []
+    with open(data_path, 'r') as f:
+        for line in f:
+            item = json.loads(line)
+            text = f"Instruction: {item['instruction']}\nInput: {item['input']}\nOutput: {item['output']}"
+            raw_dataset.append({"text": text})
+    
+    from datasets import Dataset
+    dataset = Dataset.from_list(raw_dataset)
+    tokenized_dataset = dataset.map(
+        preprocess_function,
+        remove_columns=dataset.column_names,
+        num_proc=1
+    )
+    
     training_args = TrainingArguments(
         output_dir=output_dir,
         per_device_train_batch_size=micro_batch_size,
@@ -288,7 +273,7 @@ def train(
         learning_rate=learning_rate,
         fp16=False,
         bf16=False,
-        logging_steps=10,
+        logging_steps=5,
         save_strategy="epoch",
         save_total_limit=3,
         push_to_hub=False,
@@ -296,13 +281,10 @@ def train(
         gradient_checkpointing=False,
         optim="adamw_torch",
         max_grad_norm=0.3,
-        warmup_ratio=0.03,
-        weight_decay=0.01,
         remove_unused_columns=False,
-        torch_compile=False,
+        torch_compile=False
     )
     
-    # 创建 trainer
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -380,6 +362,61 @@ def test_setup():
         print(f"错误堆栈: {traceback.format_exc()}")
         return False
 
+def clear_memory():
+  """Clear GPU memory before training"""
+  if torch.backends.mps.is_available():
+    torch.mps.empty_cache()
+  torch.cuda.empty_cache()  # For GPU users
+  gc.collect()  # Clear CPU memory
+  
+def get_memory_status():
+  """Get current memory usage status"""
+  memory_info = {}
+  
+  if torch.backends.mps.is_available():
+    memory_info['mps_allocated'] = torch.mps.current_allocated_memory() / 1024**3
+    memory_info['mps_max'] = 9.07  # Your MPS max memory
+    
+  process = psutil.Process()
+  memory_info['ram_used'] = process.memory_info().rss / 1024**3
+  memory_info['ram_percent'] = psutil.virtual_memory().percent
+  
+  return memory_info
+
 if __name__ == "__main__":
-    success = test_setup()
-    print(f"\n测试{'成功' if success else '失败'}")
+    # Clear memory before starting
+    clear_memory()
+    initial_memory = get_memory_status()
+    print("\nInitial memory status:")
+    for k, v in initial_memory.items():
+        print(f"  {k}: {v:.2f} GB")
+    
+    training_config = {
+        "base_model": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        "data_path": "data/crafting_instruction.jsonl",
+        "output_dir": "./lora-crafting",
+        "batch_size": 2,  # Reduced from 4
+        "micro_batch_size": 1,  # Reduced from 2
+        "num_epochs": 3,
+        "learning_rate": 2e-4,
+        "max_length": 256,  # Added max length control
+    }
+    
+    try:
+        print("\n=== Starting Crafting Instructions Training ===\n")
+        
+        # 打印数据集大小
+        with open(training_config["data_path"], 'r') as f:
+            num_examples = sum(1 for _ in f)
+        print(f"Found {num_examples} training examples\n")
+        
+        print("Training configuration:")
+        for k, v in training_config.items():
+            print(f"  {k}: {v}")
+            
+        success = train(**training_config)
+        print("Training completed successfully!")
+        
+    except Exception as e:
+        print(f"\nError during training: {str(e)}")
+        raise e
